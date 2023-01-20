@@ -64,6 +64,19 @@ import org.apache.rocketmq.remoting.exception.RemotingTimeoutException;
 import org.apache.rocketmq.remoting.exception.RemotingTooMuchRequestException;
 import org.apache.rocketmq.remoting.protocol.RemotingCommand;
 
+/**
+ * NettyRemotingServer线程模型: RocketMQ的RPC通信模型，1+N+M1+M2的Reactor多线程实现
+ * - 1: parentGroup，即eventLoopGroupBoss，内部只包含1个线程，线程名以NettyNIOBoss_为前缀。
+ *   负责监听 TCP网络连接请求事件，并建立好连接。随后将连接交给childGroup。
+ * - N: childGroup，即eventLoopGroupSelector，内部默认包含3个线程线程名以NettyServerNIOSelector_为前缀。
+ *   用于监听IO读写事件，并负责从网络读取数据。
+ * - M1: defaultEventExecutorGroup，当线程数默认8个线程，线程名以NettyServerCodecThread_为前缀。
+ *   主要用于执行在真正执行业务逻辑之前需要进行的SSL验证、编解码、空闲检查、网络连接管理等操作。
+ * - M2: 执行的业务请求的ChannelHandler是serverHandler，这个serverHander的源码如果进入看就会知道，它实际上也是一个分发请求的handler，
+ *   也就是说serverHandler最终会将请求根据不同的消息类型code分发到不同的process线程池处理具体的源码我们后面会分析。
+ *   不同类型的请求可能会使用不同的process线程池，这就是M2。当然我如果某个类型没有设置线程池，那就会使用默认的process线程池，
+ *   即前面初始化的defaultRequestProcessor内部的remotingExecutor线程池(默认8个线程)。
+ */
 public class NettyRemotingServer extends NettyRemotingAbstract implements RemotingServer {
     private static final InternalLogger log = InternalLoggerFactory.getLogger(RemotingHelper.ROCKETMQ_REMOTING);
     private final ServerBootstrap serverBootstrap;
@@ -96,16 +109,20 @@ public class NettyRemotingServer extends NettyRemotingAbstract implements Remoti
 
     public NettyRemotingServer(final NettyServerConfig nettyServerConfig,
         final ChannelEventListener channelEventListener) {
+        // 设置服务器单向，异步发送消息信号量
         super(nettyServerConfig.getServerOnewaySemaphoreValue(), nettyServerConfig.getServerAsyncSemaphoreValue());
+        // 创建Netty服务端启动类，引导启动服务端
         this.serverBootstrap = new ServerBootstrap();
         this.nettyServerConfig = nettyServerConfig;
         this.channelEventListener = channelEventListener;
 
+        // 服务器回调执行线程数量，默认设置为4
         int publicThreadNums = nettyServerConfig.getServerCallbackExecutorThreads();
         if (publicThreadNums <= 0) {
             publicThreadNums = 4;
         }
 
+        // 创建一个公共线程池，负责处理某些请求业务，例如发送异步消息回调，线程名以'NettyServerPublicExecutor_'为前缀
         this.publicExecutor = Executors.newFixedThreadPool(publicThreadNums, new ThreadFactory() {
             private AtomicInteger threadIndex = new AtomicInteger(0);
 
@@ -115,6 +132,10 @@ public class NettyRemotingServer extends NettyRemotingAbstract implements Remoti
             }
         });
 
+        /**
+         * 根据是否使用epoll模型，分别初始化Boss EventLoopGroup和Worker EventLoopGroup两个事件循环组
+         * Linux内核 && 指定开启Epoll && 系统支持Epoll，才会使用EpollEventLoopGroup，否则使用NioEventLoopGroup
+         */
         if (useEpoll()) {
             this.eventLoopGroupBoss = new EpollEventLoopGroup(1, new ThreadFactory() {
                 private AtomicInteger threadIndex = new AtomicInteger(0);
@@ -182,6 +203,11 @@ public class NettyRemotingServer extends NettyRemotingAbstract implements Remoti
 
     @Override
     public void start() {
+        /**
+         * 1.创建默认事件处理器，线程数默认8个线程，线程名以'NettyServerCodecThread_'为前缀
+         * 主要用于执行在真正执行业务逻辑之前需要进行的SSL验证、编解码、空闲检查、网络连接管理等操作
+         * TODO: 其工作于IO线程组之后，process线程组之前，需看下Netty源码
+         */
         this.defaultEventExecutorGroup = new DefaultEventExecutorGroup(
             nettyServerConfig.getServerWorkerThreads(),
             new ThreadFactory() {
@@ -194,15 +220,34 @@ public class NettyRemotingServer extends NettyRemotingAbstract implements Remoti
                 }
             });
 
+        /**
+         * 2.创建共享Handler
+         * - handshakeHandler: 处理TLS握手
+         * - encoder: ROCKETMQ自定义解码器
+         * - connectionManageHandler: 连接管理器，负责连接的激活、断开、超时、异常等事件
+         * - serverHandler: 服务请求处理器，处理RemotingCommand消息，即请求和响应的业务处理，并且返回相应的处理结果。这是重点
+         *   例如broker注册、producer/consumer获取Broker、Topic信息等请求都是该处理器处理，serverHandler最终会将请求根据
+         *   不同的消息类型code分发到不同的process线程池处理
+         */
         prepareSharableHandlers();
 
         ServerBootstrap childHandler =
             this.serverBootstrap.group(this.eventLoopGroupBoss, this.eventLoopGroupSelector)
+                // IO模型
                 .channel(useEpoll() ? EpollServerSocketChannel.class : NioServerSocketChannel.class)
+                /**
+                 * 设置通道的选项参数， 对于服务端而言就是ServerSocketChannel， 客户端而言就是SocketChannel
+                 * option针对Boss线程组，child针对Woker线程组
+                 */
+                // 对应的是tcp/ip协议listen函数中的backlog参数
                 .option(ChannelOption.SO_BACKLOG, nettyServerConfig.getServerSocketBacklog())
+                // 对应于套接字选项中的SO_REUSEADDR，这个参数表示允许重复使用本地地址和端口
                 .option(ChannelOption.SO_REUSEADDR, true)
+                // 对应于套接字选项中的SO_KEEPALIVE，该参数用于设置TCP连接，当设置该选项以后，连接会测试连接的状态
                 .option(ChannelOption.SO_KEEPALIVE, false)
+                // 对应于套接字选项中的TCP_NODELAY，该参数的使用与Nagle算法有关
                 .childOption(ChannelOption.TCP_NODELAY, true)
+                // 配置本地地址，监听端口为此前设置的9876
                 .localAddress(new InetSocketAddress(this.nettyServerConfig.getListenPort()))
                 .childHandler(new ChannelInitializer<SocketChannel>() {
                     @Override
@@ -218,26 +263,30 @@ public class NettyRemotingServer extends NettyRemotingAbstract implements Remoti
                             );
                     }
                 });
+        // 对应于套接字选项中的SO_SNDBUF，发送缓冲区，默认是65535
         if (nettyServerConfig.getServerSocketSndBufSize() > 0) {
             log.info("server set SO_SNDBUF to {}", nettyServerConfig.getServerSocketSndBufSize());
             childHandler.childOption(ChannelOption.SO_SNDBUF, nettyServerConfig.getServerSocketSndBufSize());
         }
+        // 对应于套接字选项中的SO_RCVBUF，接收缓冲区，默认是65535
         if (nettyServerConfig.getServerSocketRcvBufSize() > 0) {
             log.info("server set SO_RCVBUF to {}", nettyServerConfig.getServerSocketRcvBufSize());
             childHandler.childOption(ChannelOption.SO_RCVBUF, nettyServerConfig.getServerSocketRcvBufSize());
         }
+        // 用于设置写缓冲区的低水位线和高水位线
         if (nettyServerConfig.getWriteBufferLowWaterMark() > 0 && nettyServerConfig.getWriteBufferHighWaterMark() > 0) {
             log.info("server set netty WRITE_BUFFER_WATER_MARK to {},{}",
                     nettyServerConfig.getWriteBufferLowWaterMark(), nettyServerConfig.getWriteBufferHighWaterMark());
             childHandler.childOption(ChannelOption.WRITE_BUFFER_WATER_MARK, new WriteBufferWaterMark(
                     nettyServerConfig.getWriteBufferLowWaterMark(), nettyServerConfig.getWriteBufferHighWaterMark()));
         }
-
+        // 分配缓冲区
         if (nettyServerConfig.isServerPooledByteBufAllocatorEnable()) {
             childHandler.childOption(ChannelOption.ALLOCATOR, PooledByteBufAllocator.DEFAULT);
         }
 
         try {
+            // 启动Netty服务
             ChannelFuture sync = this.serverBootstrap.bind().sync();
             InetSocketAddress addr = (InetSocketAddress) sync.channel().localAddress();
             this.port = addr.getPort();
@@ -245,10 +294,20 @@ public class NettyRemotingServer extends NettyRemotingAbstract implements Remoti
             throw new RuntimeException("this.serverBootstrap.bind().sync() InterruptedException", e1);
         }
 
+        /**
+         * 若channelEventListener不为null，则启动netty事件执行器
+         * 这里的listener就是之前初始化的BrokerHousekeepingService
+         */
         if (this.channelEventListener != null) {
             this.nettyEventExecutor.start();
         }
 
+        /**
+         * 启动定时任务，初始启动3秒后执行，此后每隔1秒执行一次，扫描responseTable，将超时的ResponseFuture直接移除，并且执行这些超时ResponseFuture的回调
+         * 处理通信异常情况，RocketMQ会将请求结果封装作为一个ResponseFuture并且存入responseTable中。在发送消息时候，如果遇到服务端没有response返回给客户端
+         * 或者response因网络而丢失等异常情况。此时可能造成responseTable中的ResponseFuture累积，因此该任务会每隔一秒扫描一次responseTable，
+         * 将超时的ResponseFuture直接移除，并且执行这些超时ResponseFuture的回调。
+         */
         this.timer.scheduleAtFixedRate(new TimerTask() {
 
             @Override

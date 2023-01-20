@@ -53,6 +53,7 @@ public class NamesrvController {
 
     private RemotingServer remotingServer;
 
+    // brokerHousekeepingService是一个ChannelEventListener实现，监听Broker的Channel通道关闭事件
     private BrokerHousekeepingService brokerHousekeepingService;
 
     private ExecutorService remotingExecutor;
@@ -61,37 +62,72 @@ public class NamesrvController {
     private FileWatchService fileWatchService;
 
     public NamesrvController(NamesrvConfig namesrvConfig, NettyServerConfig nettyServerConfig) {
+        // NameServer的配置
         this.namesrvConfig = namesrvConfig;
+        // NettyServer的配置
         this.nettyServerConfig = nettyServerConfig;
+        // kv配置管理器
         this.kvConfigManager = new KVConfigManager(this);
+        // 路由信息管理器
         this.routeInfoManager = new RouteInfoManager();
+        // Broker连接的各种事件处理服务，处理Broker连接发生变化的服务
+        // 主要用于监听在Channel通道关闭事件触发时调用RouteInfoManager#onChannelDestroy清除路由信息
         this.brokerHousekeepingService = new BrokerHousekeepingService(this);
+        // 配置类，并将namesvrConfig和nettyServerConfig的配置注册到内部的allConfigs集合中
         this.configuration = new Configuration(
             log,
             this.namesrvConfig, this.nettyServerConfig
         );
+        // 存储路径配置
         this.configuration.setStorePathFromConfig(this.namesrvConfig, "configStorePath");
     }
 
     public boolean initialize() {
 
+        /**
+         * 1.加载KV配置并存储到kvConfigManager内部的configTables属性中
+         * kvConfig配置文件默认路径是${user.home}/namesrv/kvConfig.json
+         */
         this.kvConfigManager.load();
 
+        /**
+         * 2.创建remotingServer
+         * remotingServer是一个基于Netty的用于NameServer与Broker、Consumer、Producer进行网络通信的服务端
+         * 设置了一个ChannelEventListener，为此前创建的brokerHousekeepingService
+         */
         this.remotingServer = new NettyRemotingServer(this.nettyServerConfig, this.brokerHousekeepingService);
 
+        /**
+         * 3.创建远程通信执行器线程池remotingExecutor，线程数默认8，线程名以RemotingExecutorThread_为前缀
+         */
         this.remotingExecutor =
             Executors.newFixedThreadPool(nettyServerConfig.getServerWorkerThreads(), new ThreadFactoryImpl("RemotingExecutorThread_"));
 
+        /**
+         * 4.注册默认请求处理器DefaultRequestProcessor
+         * 将remotingExecutor绑定到DefaultRequestProcessor上，用作默认的请求处理线程池
+         * DefaultRequestProcessor绑定到remotingServer的defaultRequestProcessor属性上
+         * {@link NettyRemotingServer.NettyServerHandler#channelRead0(io.netty.channel.ChannelHandlerContext, org.apache.rocketmq.remoting.protocol.RemotingCommand)}
+         */
         this.registerProcessor();
 
+        /**
+         * 5.启动一个定时任务
+         * 首次启动延迟5秒执行，此后每隔10秒执行一次，用于扫描无效的Broker，并清除Broker相关路由信息的任务
+         */
         this.scheduledExecutorService.scheduleAtFixedRate(new Runnable() {
 
             @Override
             public void run() {
+                // 扫描notActive的Broker
                 NamesrvController.this.routeInfoManager.scanNotActiveBroker();
             }
         }, 5, 10, TimeUnit.SECONDS);
 
+        /**
+         * 6.启动一个定时任务
+         * 首次启动延迟1分钟执行，此后每隔10分钟执行一次打印kv配置信息的任务
+         */
         this.scheduledExecutorService.scheduleAtFixedRate(new Runnable() {
 
             @Override
@@ -100,6 +136,9 @@ public class NamesrvController {
             }
         }, 1, 10, TimeUnit.MINUTES);
 
+        /**
+         * 7.Tls传输相关配置，通信安全的文件监听模块，用来观察网络加密配置文件的更改
+         */
         if (TlsSystemConfig.tlsMode != TlsMode.DISABLED) {
             // Register a listener to reload SslContext
             try {
