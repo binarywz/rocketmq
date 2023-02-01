@@ -363,10 +363,13 @@ public class NettyRemotingServer extends NettyRemotingAbstract implements Remoti
     public void registerProcessor(int requestCode, NettyRequestProcessor processor, ExecutorService executor) {
         ExecutorService executorThis = executor;
         if (null == executor) {
+            // 默认执行器是publicExecutor，线程数默认为4个，线程名以NettyServerPublicExecutor_为前缀
             executorThis = this.publicExecutor;
         }
 
+        // 构建Pair对象
         Pair<NettyRequestProcessor, ExecutorService> pair = new Pair<NettyRequestProcessor, ExecutorService>(processor, executorThis);
+        // 存入netty remotingServer的processorTable属性中
         this.processorTable.put(requestCode, pair);
     }
 

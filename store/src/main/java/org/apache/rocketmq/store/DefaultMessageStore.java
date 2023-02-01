@@ -70,6 +70,11 @@ import org.apache.rocketmq.store.index.QueryOffsetResult;
 import org.apache.rocketmq.store.schedule.ScheduleMessageService;
 import org.apache.rocketmq.store.stats.BrokerStatsManager;
 
+/**
+ * RocketMQ核心文件存储控制类，是RocketMQ对于消息存储和获取功能的抽象，位于store模块
+ * 控制管理commitLog、consumeQueue、indexFile等文件内容的读/写，非常重要
+ * 启动Broker的时候，就会创建一个DefaultMessageStore对象，随后会通过load方法进行磁盘文件的加载和异常数据的修复
+ */
 public class DefaultMessageStore implements MessageStore {
     private static final InternalLogger log = InternalLoggerFactory.getLogger(LoggerName.STORE_LOGGER_NAME);
 
@@ -129,30 +134,45 @@ public class DefaultMessageStore implements MessageStore {
 
     public DefaultMessageStore(final MessageStoreConfig messageStoreConfig, final BrokerStatsManager brokerStatsManager,
         final MessageArrivingListener messageArrivingListener, final BrokerConfig brokerConfig) throws IOException {
+        // 消息送达的监听器，生产者消息到达时通过该监听器触发pullRequestHoldService
         this.messageArrivingListener = messageArrivingListener;
+        // Broker的配置类，包含Broker的各种配置，例如ROCKETMQ_HOME
         this.brokerConfig = brokerConfig;
+        // Broker的消息存储配置，例如各种文件大小等
         this.messageStoreConfig = messageStoreConfig;
+        // Broker状态管理器，保存Broker运行时状态，统计工作
         this.brokerStatsManager = brokerStatsManager;
+        // 创建MappedFile文件的服务，用于初始化MappedFile和预热MappedFile
         this.allocateMappedFileService = new AllocateMappedFileService(this);
+        // 实例化commitLog，DLegerCommitLog表示主从自动切换功能，默认是commitLog类型
         if (messageStoreConfig.isEnableDLegerCommitLog()) {
             this.commitLog = new DLedgerCommitLog(this);
         } else {
             this.commitLog = new CommitLog(this);
         }
+        // topic的consumeQueueMap的对应关系
         this.consumeQueueTable = new ConcurrentHashMap<>(32);
 
+        // ConsumeQueue文件的刷盘服务
         this.flushConsumeQueueService = new FlushConsumeQueueService();
+        // 清除过期commitLog文件的服务
         this.cleanCommitLogService = new CleanCommitLogService();
+        // 清除过期ConsumeQueue文件的服务
         this.cleanConsumeQueueService = new CleanConsumeQueueService();
+        // 存储一些统计指标信息的服务
         this.storeStatsService = new StoreStatsService();
+        // IndexFile索引文件服务
         this.indexService = new IndexService(this);
+        // 高可用服务，默认为null
         if (!messageStoreConfig.isEnableDLegerCommitLog()) {
             this.haService = new HAService(this);
         } else {
             this.haService = null;
         }
+        // 根据commitLog文件，更新index文件索引和ConsumeQueue文件偏移量的服务
         this.reputMessageService = new ReputMessageService();
 
+        //
         this.scheduleMessageService = new ScheduleMessageService(this);
 
         this.transientStorePool = new TransientStorePool(messageStoreConfig);
@@ -187,31 +207,69 @@ public class DefaultMessageStore implements MessageStore {
     }
 
     /**
+     * 将磁盘中的commitLog、ConsumeQueue、IndexFile文件的数据加载到内存中，还会进行数据恢复操作
+     * - 调用isTempFileExist方法判断上次broker是否正常退出，如果是正常退出不会保留abort文件，异常退出则会
+     * - 加载CommitLog日志文件，CommitLog文件是真正存储消息内容的地方
+     * - 加载ConsumeQueue文件，ConsumeQueue文件可以看作是CommitLog的消息偏移量索引文件
+     * - 加载Index索引文件，Index文件可以看作是CommitLog的消息时间范围索引文件
+     * - 恢复ConsumeQueue文件和CommitLog文件，将正确的数据恢复至内存中，删除错误数据和文件
+     * - 加载RocketMQ延迟消息的服务，包括延时等级、配置文件等
      * @throws IOException
      */
     public boolean load() {
         boolean result = true;
 
         try {
+            /**
+             * 1.判断上次broker是否是正常退出，如果是正常退出则不会保留abort文件，异常退出则会
+             *
+             * Broker在启动时会创建'{storePathRootDir}/abort'文件，并且注册JVM钩子函数，在JVM退出时删除abort文件
+             * 如果下一次启动时存在abort文件，则说明broker是异常退出的，文件数据可能不一致，需要进行数据恢复
+             */
             boolean lastExitOK = !this.isTempFileExist();
             log.info("last shutdown {}", lastExitOK ? "normally" : "abnormally");
 
+            /**
+             * 2.加载Commit Log日志文件，目录路径取自broker.conf文件中的storePathCommitLog属性
+             * Commit Log文件是真正存储消息内容的地方，单个文件默认大小1G
+             */
             // load Commit Log
             result = result && this.commitLog.load();
 
+            /**
+             * 3.加载Consume Queue文件，目录路径为{storePathRootDir}/consumequeue，文件组织方式为topic/queueId/fileName
+             * Consume Queue文件可以看作是Commit Log的索引文件，其存储了它所属Topic的消息在Commit Log中的偏移量
+             * 消费者拉取消息的时候，可以从Consume Queue中快速根据偏移量定位消息在Commit Log中的位置
+             */
             // load Consume Queue
             result = result && this.loadConsumeQueue();
 
             if (result) {
+                /**
+                 * 4.加载checkpoint检查点文件，文件位置是{storePathRootDir}/checkpoint
+                 * storeCheckPoint记录着commitLog、ConsumeQueue、Index文件的最后更新时间点
+                 * 当上一次broker是异常结束时，会根据storeCheckPoint的数据进行恢复，这决定着文件从哪里开始恢复，甚至是删除文件
+                 */
                 this.storeCheckpoint =
                     new StoreCheckpoint(StorePathConfigHelper.getStoreCheckpoint(this.messageStoreConfig.getStorePathRootDir()));
 
+                /**
+                 * 5.加载Index索引文件，目录路径为{storePathRootDir}/index
+                 * index索引文件用于通过时间区间来快速查询消息，底层为HashMap结构，实现为hash索引
+                 * 如果不是正常退出，并且最大更新时间戳比checkpoint文件中的时间戳大，则删除该 index 文件
+                 */
                 this.indexService.load(lastExitOK);
 
+                /**
+                 * 6.恢复ConsumeQueue文件和CommitLog文件，将正确的数据恢复至内存中，删除错误数据和文件
+                 */
                 this.recover(lastExitOK);
 
                 log.info("load over, and the max phy offset = {}", this.getMaxPhyOffset());
 
+                /**
+                 * 7.加载RocketMQ延迟消息的服务，包括延迟等级、配置文件等等
+                 */
                 if (null != scheduleMessageService) {
                     result =  this.scheduleMessageService.load();
                 }
@@ -222,6 +280,7 @@ public class DefaultMessageStore implements MessageStore {
             result = false;
         }
 
+        // 若上面的操作有问题，则文件服务停止
         if (!result) {
             this.allocateMappedFileService.shutdown();
         }

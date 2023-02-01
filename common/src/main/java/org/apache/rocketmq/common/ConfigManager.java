@@ -29,9 +29,12 @@ public abstract class ConfigManager {
     public boolean load() {
         String fileName = null;
         try {
+            // 配置文件路径
             fileName = this.configFilePath();
+            // 加载配置文件得到内部的json字符串数据
             String jsonString = MixAll.file2String(fileName);
 
+            // 若加载的json字符串为空，那么转而加载bak备份文件
             if (null == jsonString || jsonString.length() == 0) {
                 return this.loadBak();
             } else {
