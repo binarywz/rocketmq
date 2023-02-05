@@ -29,6 +29,14 @@ import org.apache.rocketmq.logging.InternalLoggerFactory;
 import org.apache.rocketmq.store.config.BrokerRole;
 import org.apache.rocketmq.store.config.StorePathConfigHelper;
 
+/**
+ * ConsumeQueue文件可以看作是CommitLog的索引文件，其存储了它所属Topic的消息在CommitLog中的偏移量，
+ * 消费者拉取消息的时候，可以从Consume Queue中快速的根据偏移量定位消息在CommitLog中的位置。
+ *
+ * 一个队列id目录对应着一个ConsumeQueue对象，其内部保存着一个mappedFileQueue对象，其表示当前队列id目录下面的ConsumeQueue文件
+ * 同样一个ConsumeQueue文件被映射为一个MappedFile对象。
+ * 随后ConsumeQueue及其topic和queueId的对应关系被存入DefaultMessageStore的consumeQueueTable属性集合中。
+ */
 public class ConsumeQueue {
     private static final InternalLogger log = InternalLoggerFactory.getLogger(LoggerName.STORE_LOGGER_NAME);
 
@@ -80,6 +88,18 @@ public class ConsumeQueue {
         }
     }
 
+    /**
+     * ConsumeQueue对象建立之后，会对自己管理的队列id目录下面的ConsumeQueue进行加载，内部就是调用mappedFileQueue的load方法，
+     * 即对每个ConsumeQueue文件创建一个MappedFile对象并进行内存映射mmap操作
+     * 以下是topic为'TopicTest'，4个消费队列的目录
+     * --consumequeue
+     *   --TopicTest
+     *     --0
+     *     --1
+     *     --2
+     *     --3
+     * @return
+     */
     public boolean load() {
         boolean result = this.mappedFileQueue.load();
         log.info("load consume queue " + this.topic + "-" + this.queueId + " " + (result ? "OK" : "Failed"));

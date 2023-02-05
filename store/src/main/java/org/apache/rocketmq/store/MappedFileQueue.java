@@ -147,19 +147,36 @@ public class MappedFileQueue {
 
 
     public boolean load() {
+        // 获取commitLog文件的存放目录，目录路径取自broker.conf文件中配置的storePathCommitLog
+        // 默认为$ROCKETMQ_HOME/store/commitlog
         File dir = new File(this.storePath);
+        // 获取内部的文件集合
         File[] ls = dir.listFiles();
         if (ls != null) {
+            // 若存在commitlog文件，则进行加载
             return doLoad(Arrays.asList(ls));
         }
         return true;
     }
 
+    /**
+     * 重点:
+     * 在物理上，commitlog目录下面是一个个的commitlog文件，但是在Java中进行了三层映射，CommitLog-MappedFileQueue-MappedFile
+     * - CommitLog中包含MappedFileQueue，以及commitLog相关的其他服务，例如刷盘服务
+     * - MappedFileQueue中包含MappedFile集合，以及单个commitLog文件大小等属性
+     * - MappedFile是真正的一个commitLog文件在Java中的映射，包含文件名、大小、mmap对象mappedByteBuffer等属性
+     *
+     * 注: 实际上MappedFileQueue和MappedFile都是通用类，commitlog、comsumequeue、indexfile文件都会使用到。
+     * @param files
+     * @return
+     */
     public boolean doLoad(List<File> files) {
         // ascending order
+        // 对commitlog文件按照文件名升序排序
         files.sort(Comparator.comparing(File::getName));
 
         for (File file : files) {
+            // 校验文件实际大小是否等于设置的文件大小(1G=1073741824)，若不相等则直接返回false，不在加载其他文件
             if (file.length() != this.mappedFileSize) {
                 log.warn(file + "\t" + file.length()
                         + " length not matched message store config value, please check it manually");
@@ -167,11 +184,19 @@ public class MappedFileQueue {
             }
 
             try {
+                /**
+                 * 核心代码: 每一个commitlog都创建一个对应的MappedFile对象
+                 */
                 MappedFile mappedFile = new MappedFile(file.getPath(), mappedFileSize);
 
+                // 将wrotePosition、flushedPosition、committedPosition 默认设置为文件大小
+                // 当前文件所映射到的消息写入page cache的位置
                 mappedFile.setWrotePosition(this.mappedFileSize);
+                // 刷盘的最新位置
                 mappedFile.setFlushedPosition(this.mappedFileSize);
+                // 已提交的最新位置
                 mappedFile.setCommittedPosition(this.mappedFileSize);
+                // 添加到MappedFileQueue内部的mappedFiles集合中
                 this.mappedFiles.add(mappedFile);
                 log.info("load " + file.getPath() + " OK");
             } catch (IOException e) {

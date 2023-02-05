@@ -1461,35 +1461,56 @@ public class DefaultMessageStore implements MessageStore {
     }
 
     private boolean isTempFileExist() {
+        // 获取临时文件路径，路径为: {storePathRootDir}/abort
         String fileName = StorePathConfigHelper.getAbortFile(this.messageStoreConfig.getStorePathRootDir());
         File file = new File(fileName);
         return file.exists();
     }
 
+    /**
+     * 加载消费队列文件
+     * ConsumeQueue文件可以看作是CommitLog的索引文件，其存储了它所属Topic的消息在CommitLog中的偏移量.
+     * 消费者拉取消息的时候，可以从Consume Queue中快速的根据偏移量定位消息在CommitLog中的位置
+     *
+     * 一个队列id目录对应着一个ConsumeQueue对象，其内部保存着一个mappedFileQueue对象，其表示当前队列id目录下面的ConsumeQueue文件集合，
+     * 同样一个ConsumeQueue文件被映射为一个MappedFile对象。
+     * 随后ConsumeQueue及其topic和queueId的对应关系被存入DefaultMessageStore的consumeQueueTable属性集合中。
+     * @return
+     */
     private boolean loadConsumeQueue() {
+        // 获取ConsumeQueue文件所在目录，目录路径为{storePathRootDir}/consumequeue
         File dirLogic = new File(StorePathConfigHelper.getStorePathConsumeQueue(this.messageStoreConfig.getStorePathRootDir()));
+        // 获取目录下文件列表，实际上就是topic目录列表
         File[] fileTopicList = dirLogic.listFiles();
         if (fileTopicList != null) {
 
+            // 遍历topic目录
             for (File fileTopic : fileTopicList) {
+                // 获取topic名字
                 String topic = fileTopic.getName();
 
+                // 获取topic目录下面的队列id目录
                 File[] fileQueueIdList = fileTopic.listFiles();
                 if (fileQueueIdList != null) {
                     for (File fileQueueId : fileQueueIdList) {
                         int queueId;
                         try {
+                            // 获取队列id
                             queueId = Integer.parseInt(fileQueueId.getName());
                         } catch (NumberFormatException e) {
                             continue;
                         }
+                        // 创建ConsumeQueue对象，一个队列id目录对应着一个ConsumeQueue对象
                         ConsumeQueue logic = new ConsumeQueue(
                             topic,
                             queueId,
                             StorePathConfigHelper.getStorePathConsumeQueue(this.messageStoreConfig.getStorePathRootDir()),
+                            // 大小默认30w数据
                             this.getMessageStoreConfig().getMappedFileSizeConsumeQueue(),
                             this);
+                        // 将当前ConsumeQueue对象及其对应关系存入ConsumeQueueTable中
                         this.putConsumeQueue(topic, queueId, logic);
+                        // 加载ConsumeQueue文件
                         if (!logic.load()) {
                             return false;
                         }

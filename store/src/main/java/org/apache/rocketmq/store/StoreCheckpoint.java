@@ -27,6 +27,17 @@ import org.apache.rocketmq.common.constant.LoggerName;
 import org.apache.rocketmq.logging.InternalLogger;
 import org.apache.rocketmq.logging.InternalLoggerFactory;
 
+/**
+ * 在CommitLog和ConsumeQueue文件都加载成功之后，加载CheckPoint检查点文件，创建storeCheckPoint对象，
+ * 文件位置是{storePathRootDir}/checkpoint
+ * StoreCheckPoint记录着CommitLog、ConsumeQueue、Index文件的最后更新时间点，当上一次Broker是异常结束时，会根据
+ * StoreCheckPoint的数据进行恢复，这决定着文件从哪里开始恢复，甚至是删除文件
+ *
+ * StoreCheckPoint记录了三个关键属性:
+ * - physicMsgTimestamp: 最新CommitLog文件的刷盘时间戳，单位毫秒
+ * - logicsMsgTimestamp: 最新ConsumeQueue文件的刷盘时间戳，单位毫秒
+ * - indexMsgTimestamp: 创建最新IndexFile文件的时间戳，单位毫秒
+ */
 public class StoreCheckpoint {
     private static final InternalLogger log = InternalLoggerFactory.getLogger(LoggerName.STORE_LOGGER_NAME);
     private final RandomAccessFile randomAccessFile;
@@ -36,19 +47,30 @@ public class StoreCheckpoint {
     private volatile long logicsMsgTimestamp = 0;
     private volatile long indexMsgTimestamp = 0;
 
+    /**
+     * 创建StoreCheckPoint检查点对象
+     * @param scpPath
+     * @throws IOException
+     */
     public StoreCheckpoint(final String scpPath) throws IOException {
         File file = new File(scpPath);
+        // 判断文件是否存在
         MappedFile.ensureDirOK(file.getParent());
         boolean fileExists = file.exists();
 
+        // 对CheckPoint文件同样执行mmap操作
         this.randomAccessFile = new RandomAccessFile(file, "rw");
         this.fileChannel = this.randomAccessFile.getChannel();
+        // mmap大小为OS_PAGE_SIZE，即OS一页，4k
         this.mappedByteBuffer = fileChannel.map(MapMode.READ_WRITE, 0, MappedFile.OS_PAGE_SIZE);
 
         if (fileExists) {
             log.info("store checkpoint file exists, " + scpPath);
+            // 获取commitlog文件的时间戳，即最新commitlog文件的刷盘时间戳
             this.physicMsgTimestamp = this.mappedByteBuffer.getLong(0);
+            // 获取consumeQueue文件的时间戳，即最新consumeQueue文件的刷盘时间戳
             this.logicsMsgTimestamp = this.mappedByteBuffer.getLong(8);
+            // 获取index文件的时间戳，即创建最新indexfile文件的时间戳
             this.indexMsgTimestamp = this.mappedByteBuffer.getLong(16);
 
             log.info("store checkpoint file physicMsgTimestamp " + this.physicMsgTimestamp + ", "

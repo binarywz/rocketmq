@@ -42,6 +42,10 @@ import org.apache.rocketmq.store.config.FlushDiskType;
 import org.apache.rocketmq.store.util.LibC;
 import sun.nio.ch.DirectBuffer;
 
+/**
+ * RocketMQ物理文件在Java中的映射类，commitLog/consumerQueue/indexFile 3种文件磁盘的读写都是通过MappedFile操作的
+ * 它的构造器中会对当前文件进行mmap内存映射操作
+ */
 public class MappedFile extends ReferenceResource {
     public static final int OS_PAGE_SIZE = 1024 * 4;
     protected static final InternalLogger log = InternalLoggerFactory.getLogger(LoggerName.STORE_LOGGER_NAME);
@@ -70,6 +74,7 @@ public class MappedFile extends ReferenceResource {
     }
 
     public MappedFile(final String fileName, final int fileSize) throws IOException {
+        // 调用init初始化
         init(fileName, fileSize);
     }
 
@@ -150,17 +155,25 @@ public class MappedFile extends ReferenceResource {
     }
 
     private void init(final String fileName, final int fileSize) throws IOException {
+        // 文件名 长度为20位，左边补零，剩余为起始偏移量，比如00000000000000000000代表了第一个文件，起始偏移量为0
         this.fileName = fileName;
+        // 文件大小，默认1G=1073741824
         this.fileSize = fileSize;
+        // 构建File对象
         this.file = new File(fileName);
+        // 构建文件起始索引，就是取自文件名
         this.fileFromOffset = Long.parseLong(this.file.getName());
         boolean ok = false;
 
+        // 确保文件目录存在
         ensureDirOK(this.file.getParent());
 
         try {
+            // 对当前commitLog文件构建文件通道fileChannel
             this.fileChannel = new RandomAccessFile(this.file, "rw").getChannel();
+            // 把commitLog文件完全的映射到虚拟内存，也就是内存映射，即mmap，提升读写性能
             this.mappedByteBuffer = this.fileChannel.map(MapMode.READ_WRITE, 0, fileSize);
+            // 记录数据
             TOTAL_MAPPED_VIRTUAL_MEMORY.addAndGet(fileSize);
             TOTAL_MAPPED_FILES.incrementAndGet();
             ok = true;
