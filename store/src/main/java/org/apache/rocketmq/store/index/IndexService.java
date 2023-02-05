@@ -54,17 +54,28 @@ public class IndexService {
             StorePathConfigHelper.getStorePathIndex(store.getMessageStoreConfig().getStorePathRootDir());
     }
 
+    /**
+     * 加载Index文件
+     * @param lastExitOK 上次是否正常退出
+     * @return
+     */
     public boolean load(final boolean lastExitOK) {
+        // 获取上级目录路径，{storePathRootDir}/index
         File dir = new File(this.storePath);
+        // 获取内部的index索引文件
         File[] files = dir.listFiles();
         if (files != null) {
             // ascending order
+            // 按照文件名字中的时间戳排序
             Arrays.sort(files);
             for (File file : files) {
                 try {
+                    // 一个index文件对应着一个IndexFile实例
                     IndexFile f = new IndexFile(file.getPath(), this.hashSlotNum, this.indexNum, 0, 0);
+                    // 加载index文件
                     f.load();
 
+                    // 若上一次是异常退出，并且当前index文件中最后一个消息的落盘时间戳大于最后一个index索引创建时间，则该索引文件被删除
                     if (!lastExitOK) {
                         if (f.getEndTimestamp() > this.defaultMessageStore.getStoreCheckpoint()
                             .getIndexMsgTimestamp()) {
@@ -74,6 +85,7 @@ public class IndexService {
                     }
 
                     log.info("load index file OK, " + f.getFileName());
+                    // 添加到索引文件集合
                     this.indexFileList.add(f);
                 } catch (IOException e) {
                     log.error("load file {} error", file, e);

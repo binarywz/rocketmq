@@ -27,6 +27,10 @@ import org.apache.rocketmq.logging.InternalLogger;
 import org.apache.rocketmq.logging.InternalLoggerFactory;
 import org.apache.rocketmq.store.MappedFile;
 
+/**
+ * Index索引文件用于通过时间区间来快速查询消息，底层为HashMap结构，实现为hash索引
+ * 一个Index文件对应着一个IndexFile实例，并且会加到IndexFileList集合中
+ */
 public class IndexFile {
     private static final InternalLogger log = InternalLoggerFactory.getLogger(LoggerName.STORE_LOGGER_NAME);
     private static int hashSlotSize = 4;
