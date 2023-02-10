@@ -71,3 +71,8 @@ $ROCKETMQ_HOME/store/consumequeue/{topic}/{queueId}/{fileName}
 同样consumequeue文件中的条目采取定长设计，每个条目共20字节，分别为8字节的commitlog物理偏移量、4字节的消息长度、8字节tag hashcode，单个文件由30W个条目组成，可以像数组一样随机访问每一个条目，每个ConsumeQueue文件大小约5.72M。
 
 ConsumeQueue名字长度为20位，左边补零，剩余为起始偏移量；比如00000000000000000000代表第一个文件，起始偏移量为0，文件大小为600w，当第一个文件满之后创建的第二个文件的名字为00000000000006000000，起始偏移量为6000000，以此类推，消息存储的时候会顺序写入文件，当文件写满了，写入下一个文件。
+
+### Index索引文件简介
+
+索引文件`IndexFile`提供了一种可以通过key或事件区间来查询方法的方法。Index文件的存储位置是`$ROCKETMQ_HOME/store/index/{filename}`，文件名`filename`是以创建的时间戳命名的，固定的单个`IndexFile`文件大小约为400M，一个`IndexFile`可以保存2000w个索引，`IndexFile`的底层存储设计为在文件系统中实现`HashMap`结构，估`RocketMQ`的索引文件其底层实现为`hash`索引
+

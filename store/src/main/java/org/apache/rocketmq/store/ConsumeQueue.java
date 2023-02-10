@@ -109,41 +109,73 @@ public class ConsumeQueue {
         return result;
     }
 
+    /**
+     * 重点
+     * 恢复ConsumeQueue，一个队列ID目录对应着一个ConsumeQueue对象，因此ConsumeQueue内部保存着多个属于同一
+     * queueId的ConsumeQueue文件。
+     * RocketMQ不会也没必要对所有的ConsumeQueue文件进行恢复校验，若ConsumeQueue文件数量大于等于3个，那么就取
+     * 最新的3个ConsumeQueue文件执行恢复，否则对全部ConsumeQueue文件进行恢复。
+     * 所谓的恢复，就是找出当前queueId的ConsumeQueue下的所有ConsumeQueue文件中的最大的有效CommitLog消息日志
+     * 文件的物理偏移量，以及该索引文件自身的最大有效数据偏移量，随后对文件自身的最大有效数据偏移量processOffset之后的
+     * 所有文件和数据进行更新或者删除。
+     * 如何判断ConsumeQueue索引文件中的一个索引条目有效，或者说是有效数据呢？只要该条目保存的对应的消息在CommitLog文件中
+     * 的物理偏移量和该条目保存的对应消息在CommitLog文件中的总长度都大于0则表示当前条目有效，否则表示该条目无效，并且不会对
+     * 后学的条目和文件进行恢复。
+     * 最大的有效CommitLog消息物理偏移量，就是指最后一个有效条目中保存的CommitLog文件中的物理偏移量，而文件自身的最大有效数据
+     * 偏移量processOffset，就是指的最后一个有效条目在自身文件中的偏移量。
+     */
     public void recover() {
+        // 获取所有的ConsumeQueue文件映射的mappedFiles集合
         final List<MappedFile> mappedFiles = this.mappedFileQueue.getMappedFiles();
         if (!mappedFiles.isEmpty()) {
-
+            // 从倒数第三个文件开始恢复
             int index = mappedFiles.size() - 3;
+            // 不足3个文件，则直接从第一个文件开始恢复
             if (index < 0)
                 index = 0;
 
+            // ConsumeQueue映射文件的文件大小
             int mappedFileSizeLogics = this.mappedFileSize;
+            // 获取文件对应的映射对象
             MappedFile mappedFile = mappedFiles.get(index);
+            // 文件映射对应的DirectByteBuffer
             ByteBuffer byteBuffer = mappedFile.sliceByteBuffer();
+            // 获取文件映射的初始物理偏移量，与文件名相同
             long processOffset = mappedFile.getFileFromOffset();
+            // ConsumeQueue映射文件的有效offset
             long mappedFileOffset = 0;
             long maxExtAddr = 1;
             while (true) {
+                // 检查每一个索引条目的有效性，CQ_STORE_UNIT_SIZE是每个条目的大小，默认20
                 for (int i = 0; i < mappedFileSizeLogics; i += CQ_STORE_UNIT_SIZE) {
+                    // 获取该条目对应的消息在CommitLog文件中的物理偏移量
                     long offset = byteBuffer.getLong();
+                    // 获取该条目对应的消息在CommitLog文件中的总长度
                     int size = byteBuffer.getInt();
+                    // 获取该条目对应的消息的tag哈希值
                     long tagsCode = byteBuffer.getLong();
-
+                    // 若offset和size都大于0，则表示当前条目有效
                     if (offset >= 0 && size > 0) {
+                        // 更新当前ConsumeQueue文件中的有效数据偏移量
                         mappedFileOffset = i + CQ_STORE_UNIT_SIZE;
+                        // 更新当前queueId目录下的所有ConsumeQueue文件中最大有效物理偏移量
                         this.maxPhysicOffset = offset + size;
                         if (isExtAddr(tagsCode)) {
                             maxExtAddr = tagsCode;
                         }
                     } else {
+                        // 当前条目无效，后续的条目不会遍历
                         log.info("recover current consume queue file over,  " + mappedFile.getFileName() + " "
                             + offset + " " + size + " " + tagsCode);
                         break;
                     }
                 }
 
+                // 若当前ConsumeQueue文件中的有效数据偏移量和文件大小是一致的，则表示该ConsumeQueue文件的所有条目都是有效的
                 if (mappedFileOffset == mappedFileSizeLogics) {
+                    // 校验下一个文件
                     index++;
+                    // 遍历到了最后一个文件，则结束遍历
                     if (index >= mappedFiles.size()) {
 
                         log.info("recover last consume queue file over, last mapped file "
@@ -157,15 +189,20 @@ public class ConsumeQueue {
                         log.info("recover next consume queue file, " + mappedFile.getFileName());
                     }
                 } else {
+                    // 若不相等，则表示当前ConsumeQueue有部分无效数据，恢复结束
                     log.info("recover current consume queue queue over " + mappedFile.getFileName() + " "
                         + (processOffset + mappedFileOffset));
                     break;
                 }
             }
 
+            // 该文件映射的已恢复的物理量
             processOffset += mappedFileOffset;
+            // 设置当前queueId下面的所有的ConsumeQueue文件的最新数据
             this.mappedFileQueue.setFlushedWhere(processOffset);
+            // 设置刷盘最新位置，提交的最新位置
             this.mappedFileQueue.setCommittedWhere(processOffset);
+            // 删除文件最大有效数据偏移量processOffset之后的所有数据
             this.mappedFileQueue.truncateDirtyFiles(processOffset);
 
             if (isExtReadEnable()) {

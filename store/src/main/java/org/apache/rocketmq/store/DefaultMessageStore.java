@@ -1524,6 +1524,13 @@ public class DefaultMessageStore implements MessageStore {
         return true;
     }
 
+    /**
+     * 恢复CommitLog和ConsumeQueue数据到内存中
+     * - 恢复所有的ConsumeQueue文件，返回在ConsumeQueue有效区域存储的最大CommitLog偏移量
+     * - 恢复CommitLog文件，根据上次broker是否正常退出，有正常恢复和异常恢复的选择
+     * - 最后对TopicQueueTable进行恢复
+     * @param lastExitOK 上次是否正常退出
+     */
     private void recover(final boolean lastExitOK) {
         long maxPhyOffsetOfConsumeQueue = this.recoverConsumeQueue();
 
@@ -1558,17 +1565,27 @@ public class DefaultMessageStore implements MessageStore {
         }
     }
 
+    /**
+     * 恢复ConsumeQueue文件，删除无效的ConsumeQueue文件，最后返回在ConsumeQueue有效区域存储的最大的CommitLog
+     * 物理偏移量，该值表示消息在CommitLog文件中最后写完的指针，即CommitLog中的有效消息数据最大文件偏移量
+     * @return
+     */
     private long recoverConsumeQueue() {
         long maxPhysicOffset = -1;
+        // 遍历ConsumeQueueTable的value集合，即queueId到ConsumeQueue的Map映射
         for (ConcurrentMap<Integer, ConsumeQueue> maps : this.consumeQueueTable.values()) {
+            // 遍历所有的ConsumeQueue
             for (ConsumeQueue logic : maps.values()) {
+                // 恢复ConsumeQueue，删除无效ConsumeQueue文件
                 logic.recover();
+                // 若当前queueId目录下的所有ConsumeQueue文件的最大有效物理偏移量大于此前记录的最大有效物理偏移量
+                // 则更新记录的ConsumeQueue文件的最大CommitLog有效物理偏移量
                 if (logic.getMaxPhysicOffset() > maxPhysicOffset) {
                     maxPhysicOffset = logic.getMaxPhysicOffset();
                 }
             }
         }
-
+        // 返回ConsumeQueue文件的最大CommitLog有效物理偏移量
         return maxPhysicOffset;
     }
 
